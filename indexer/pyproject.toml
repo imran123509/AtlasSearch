@@ -1,0 +1,42 @@
+[project]
+name = "atlas-indexer"
+version = "0.1.0"
+description = "AtlasSearch parse stage — charset, HTML5 tree, boilerplate, fields, links"
+requires-python = ">=3.11"
+dependencies = [
+    "selectolax>=0.3.21",        # lexbor: HTML5 spec-compliant, error-tolerant
+    "charset-normalizer>=3.3",
+    "py3langid>=0.3",
+    "structlog>=24.1",
+    "prometheus-client>=0.20",
+    "aiokafka>=0.11",
+    "aioboto3>=13.0",
+    # Canonicalisation MUST be identical to the crawler's or the same URL gets
+    # two fingerprints. Shared deliberately; see README — this belongs in a
+    # common package, not as a dependency in this direction.
+    "atlas-crawler",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.5"]
+
+[tool.uv.sources]
+atlas-crawler = { path = "../crawler", editable = true }
+
+[project.scripts]
+atlas-indexer = "atlas_indexer.main:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/atlas_indexer"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
