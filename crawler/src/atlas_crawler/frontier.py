@@ -26,6 +26,13 @@ from typing import Any
 import structlog
 
 from .config import Config
+from .dedup import (
+    RedisBloom,
+    RedisExactStore,
+    SeenUrlFilter,
+    SiteBudget,
+    TrapDetector,
+)
 from .models import CrawlTask
 from .urlnorm import canonicalise, registrable_domain
 
@@ -85,12 +92,30 @@ return {host, url}
 
 
 class Frontier:
-    def __init__(self, redis: Any, config: Config, *, prefix: str = "fr:") -> None:
+    def __init__(
+        self,
+        redis: Any,
+        config: Config,
+        *,
+        prefix: str = "fr:",
+        seen: SeenUrlFilter | None = None,
+        traps: TrapDetector | None = None,
+    ) -> None:
         self.redis = redis
         self.cfg = config
         self.p = prefix
         self._enqueue = redis.register_script(_ENQUEUE_LUA)
         self._lease_one = redis.register_script(_LEASE_LUA)
+
+        # The global "have we EVER seen this URL" test. Distinct from the
+        # per-host in-queue set below, which is deleted on lease and therefore
+        # cannot stop a released URL from being re-queued forever.
+        self.seen = seen if seen is not None else SeenUrlFilter(
+            RedisBloom(redis, prefix=f"{prefix}bloom"),
+            RedisExactStore(redis, prefix=f"{prefix}exact"),
+        )
+        self.traps = traps if traps is not None else TrapDetector(redis, prefix=f"{prefix}trap")
+        self.budget = SiteBudget(redis, prefix=prefix.rstrip(":"))
 
     # -- keys ---------------------------------------------------------------
     def _front(self, band: int) -> str:
@@ -121,19 +146,87 @@ class Frontier:
         depth: int = 0,
         source_url: str | None = None,
     ) -> bool:
-        """Offer a URL to the frontier. Returns False if it was rejected."""
-        url = canonicalise(url)
+        """Offer a URL to the frontier. Returns False if it was rejected.
+
+        Prefer `add_many` — batching the seen-URL test is the whole point of
+        that design (features/URL-DE-DUPLICATION.md).
+        """
+        accepted = await self.add_many(
+            [url], priority=priority, depth=depth, source_url=source_url
+        )
+        return bool(accepted)
+
+    async def add_many(
+        self,
+        urls: list[str],
+        *,
+        priority: int = 500,
+        depth: int = 0,
+        source_url: str | None = None,
+    ) -> list[str]:
+        """Offer many URLs at once. Returns the ones actually queued.
+
+        Ordering here is load-bearing:
+
+          1. trap demotion   cheap, no side effect
+          2. budget *peek*   read-only
+          3. seen filter     marks URLs seen — irreversible
+          4. budget spend    charged only for URLs actually queued
+
+        Doing (3) before (2) would mark a URL seen and then reject it on budget,
+        losing it permanently: the budget counter resets weekly, but a Bloom
+        filter has no un-see operation.
+        """
+        canonical: list[str] = []
+        for raw in urls:
+            try:
+                canonical.append(canonicalise(raw))
+            except Exception:  # noqa: BLE001 - a malformed URL is data, not a crash
+                continue
+
+        # 1. Demoted path patterns — the trap detector's verdict.
+        keep: list[str] = []
+        for url in canonical:
+            if self.traps is not None and await self.traps.is_demoted(url):
+                log.debug("frontier.trap_demoted", url=url)
+                continue
+            keep.append(url)
+
+        # 2. Budget peek, before anything irreversible happens.
+        #    A per-domain allowance is carried across the batch: checking
+        #    `exhausted()` once per domain would let a batch larger than the
+        #    remaining budget through wholesale, because nothing is charged
+        #    until step 4.
+        affordable: list[str] = []
+        remaining: dict[str, int] = {}
+        for url in keep:
+            domain = registrable_domain(url)
+            if domain not in remaining:
+                limit = await self.budget.limit_for(domain)
+                spent = await self.budget.spent(domain)
+                remaining[domain] = max(0, limit - spent)
+            if remaining[domain] <= 0:
+                log.debug("frontier.budget_exhausted", domain=domain)
+                continue
+            remaining[domain] -= 1
+            affordable.append(url)
+
+        # 3. Global seen-URL test, batched into one sweep per shard.
+        fresh = await self.seen.filter_new(affordable) if self.seen else affordable
+
+        queued: list[str] = []
+        for url in fresh:
+            if await self._enqueue_one(url, priority=priority, depth=depth,
+                                       source_url=source_url):
+                # 4. Charge the budget only for URLs we actually queued.
+                await self.budget.spend(registrable_domain(url))
+                queued.append(url)
+        return queued
+
+    async def _enqueue_one(
+        self, url: str, *, priority: int, depth: int, source_url: str | None
+    ) -> bool:
         domain = registrable_domain(url)
-
-        # Per-site URL budget: the single most effective defence against crawl
-        # traps, and it works without ever identifying a trap as such.
-        spent = await self.redis.incr(self._budget(domain))
-        if spent == 1:
-            await self.redis.expire(self._budget(domain), 7 * 24 * 3600)
-        if spent > await self.site_budget(domain):
-            log.debug("frontier.budget_exhausted", domain=domain, spent=spent)
-            return False
-
         band = _band_for(priority)
         await self.redis.zadd(self._front(band), {url: float(priority)})
 
@@ -150,12 +243,8 @@ class Frontier:
         return int(res) == 1
 
     async def site_budget(self, domain: str) -> int:
-        """base × log(1 + authority). Authority is 0 until PageRank feeds it back."""
-        raw = await self.redis.get(f"{self.p}auth:{domain}")
-        authority = float(raw) if raw else 0.0
-        import math
-
-        return int(500 * math.log1p(1.0 + authority * 1000))
+        """base x log(1 + authority). Authority is 0 until PageRank feeds it back."""
+        return await self.budget.limit_for(domain)
 
     # -- read ---------------------------------------------------------------
     async def lease(self, count: int = 1) -> list[CrawlTask]:
@@ -202,6 +291,33 @@ class Frontier:
         current = await self.redis.get(self._lease(task.url))
         if current is not None and _s(current) == task.lease_token:
             await self.redis.delete(self._lease(task.url))
+
+    async def schedule_recrawl(
+        self, url: str, *, delay_s: float = 0.0, priority: int = 500
+    ) -> bool:
+        """Re-offer a URL we have already crawled, bypassing the seen filter.
+
+        This door has to exist. The global seen-URL test is a *discovery* filter:
+        it answers "have we ever encountered this link before". Refresh is a
+        different question — every indexed document is re-fetched on a schedule
+        (daily for tier 0, weekly for tier 1, ~45 days for tier 2), and routing
+        that through `add()` would reject all of it, freezing the corpus at
+        first-crawl state.
+
+        Site budget is not charged either: refreshing a page we already hold is
+        not new consumption of the site's allowance.
+        """
+        url = canonicalise(url)
+        if self.traps is not None and await self.traps.is_demoted(url):
+            return False
+
+        domain = registrable_domain(url)
+        due = int((time.time() + delay_s) * 1000)
+        await self.redis.zadd(self._front(_band_for(priority)), {url: float(priority)})
+        await self.redis.rpush(self._back(domain), url)
+        await self.redis.sadd(self._seen_in_queue(domain), url)
+        await self.redis.zadd(self._heap, {domain: due})
+        return True
 
     async def requeue(self, task: CrawlTask, *, delay_s: float = 0.0) -> None:
         """Put a URL back, optionally after a delay (5xx decay, rate-limit deferral)."""

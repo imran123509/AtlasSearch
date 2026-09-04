@@ -98,7 +98,9 @@ async def test_validators_are_stored_for_the_next_conditional_get(worker):
     )
     await _run_once(worker, "https://example.com/p")
 
-    await worker.frontier.add("https://example.com/p")
+    # A refresh, not a re-discovery: `add()` would be rejected by the global
+    # seen filter, which is exactly why schedule_recrawl exists.
+    await worker.frontier.schedule_recrawl("https://example.com/p")
     task = (await worker.frontier.lease(1))[0]
     assert task.etag == 'W/"v1"'
     assert task.last_modified == "Mon, 1 Sep 2025 00:00:00 GMT"

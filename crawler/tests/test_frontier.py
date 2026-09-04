@@ -120,3 +120,123 @@ async def test_stats_reports_scheduled_and_due(frontier):
 
 async def test_empty_frontier_leases_nothing(frontier):
     assert await frontier.lease(5) == []
+
+
+# ---------------------------------------------------------------------------
+# Global de-duplication (features/URL-DE-DUPLICATION.md)
+# ---------------------------------------------------------------------------
+
+async def test_a_released_url_cannot_be_requeued_forever(frontier):
+    """The bug the global seen-URL filter exists to fix.
+
+    The per-host in-queue set is DELETED on lease, so before the seen filter a
+    URL that had been crawled and released could be re-offered indefinitely —
+    every link to a popular page would re-crawl it.
+    """
+    assert await frontier.add("https://example.com/a") is True
+    task = (await frontier.lease(1))[0]
+    await frontier.release(task)
+
+    assert await frontier.add("https://example.com/a") is False
+
+
+async def test_seen_test_survives_canonical_variants(frontier):
+    await frontier.add("https://example.com/p?id=4")
+    assert await frontier.add("HTTPS://Example.COM/p?utm_source=nl&id=4#x") is False
+
+
+async def test_budget_exhaustion_does_not_permanently_lose_urls(frontier, redis):
+    """Ordering matters: seen-marking is irreversible, budget is not.
+
+    If the seen filter ran before the budget check, a URL rejected for budget
+    would be marked seen and never offered again — the counter resets weekly but
+    a Bloom filter has no un-see operation.
+    """
+    await redis.set("fr:auth:small.test", "0")
+    limit = await frontier.site_budget("small.test")
+
+    urls = [f"https://small.test/p{i}" for i in range(limit + 40)]
+    queued = await frontier.add_many(urls)
+    assert len(queued) == limit, "budget was not enforced"
+
+    rejected = [u for u in urls if u not in set(queued)]
+    assert rejected
+
+    # Budget window resets (or authority is raised); the rejected URLs must
+    # still be offerable — proving they were never marked seen.
+    await redis.delete("fr:budget:small.test")
+    assert await frontier.add_many(rejected), "budget rejection consumed the URLs permanently"
+
+
+async def test_add_many_batches_the_seen_test(frontier):
+    urls = [f"https://example.com/p{i}" for i in range(200)]
+    queued = await frontier.add_many(urls)
+    assert len(queued) == 200
+    # One sweep for the whole batch, not one per URL.
+    assert frontier.seen.stats.checked == 200
+    assert frontier.seen.stats.bloom_absorption > 0.9
+
+
+async def test_trap_demoted_patterns_are_rejected(frontier):
+    await frontier.traps.demote("trap.test/calendar")
+    assert await frontier.add("https://trap.test/calendar/2026/03/15") is False
+    assert await frontier.add("https://trap.test/articles/real") is True
+
+
+async def test_trap_detection_then_frontier_rejection(frontier):
+    """End to end: the detector observes a generator, the frontier stops feeding it.
+
+    Thresholds must be set before observing — demotion is written at observe
+    time, so lowering `min_urls` afterwards does not demote retroactively.
+    """
+    frontier.traps.min_urls = 50
+    frontier.traps.max_distinct_ratio = 0.05
+    for i in range(120):
+        await frontier.traps.observe(f"https://gen.test/cal/{i}", "sha256:identical")
+    assert await frontier.add("https://gen.test/cal/99999") is False
+
+
+async def test_requeue_bypasses_the_seen_filter(frontier):
+    """A retry is not a re-discovery. Requeue must not be blocked by the filter."""
+    await frontier.add("https://example.com/a")
+    task = (await frontier.lease(1))[0]
+    await frontier.requeue(task, delay_s=0)
+    assert [t.url for t in await frontier.lease(1)] == ["https://example.com/a"]
+
+
+async def test_malformed_urls_do_not_break_a_batch(frontier):
+    queued = await frontier.add_many(["http://[bad", "https://example.com/good"])
+    assert queued == ["https://example.com/good"]
+
+
+async def test_recrawl_bypasses_the_seen_filter(frontier):
+    """Refresh must not be blocked by the discovery filter.
+
+    Every indexed document is re-fetched on a schedule; routing that through
+    `add()` would reject all of it and freeze the corpus at first-crawl state.
+    """
+    await frontier.add("https://example.com/a")
+    task = (await frontier.lease(1))[0]
+    await frontier.release(task)
+
+    assert await frontier.add("https://example.com/a") is False       # discovery: no
+    assert await frontier.schedule_recrawl("https://example.com/a")   # refresh: yes
+    assert [t.url for t in await frontier.lease(1)] == ["https://example.com/a"]
+
+
+async def test_recrawl_does_not_charge_the_site_budget(frontier, redis):
+    """Refreshing a page we already hold is not new consumption of the allowance."""
+    await frontier.add("https://example.com/a")
+    spent_before = await frontier.budget.spent("example.com")
+    await frontier.schedule_recrawl("https://example.com/a")
+    assert await frontier.budget.spent("example.com") == spent_before
+
+
+async def test_recrawl_still_respects_trap_demotion(frontier):
+    await frontier.traps.demote("gen.test/cal")
+    assert await frontier.schedule_recrawl("https://gen.test/cal/1") is False
+
+
+async def test_recrawl_with_delay_is_deferred(frontier):
+    await frontier.schedule_recrawl("https://example.com/a", delay_s=60)
+    assert await frontier.lease(1) == []

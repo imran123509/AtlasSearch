@@ -21,7 +21,8 @@ lease URL from frontier
 | `fetcher.py` | The fetch loop and the response-handling table |
 | `ratelimit.py` | Paired token buckets + AIMD. **The only place politeness is enforced.** |
 | `robots.py` | robots.txt fetch/cache/evaluate, `X-Robots-Tag` |
-| `frontier.py` | Front/back queues, due heap, leases, per-site budget |
+| `dedup.py` | Seen-URL filter (Bloom + exact), site budgets, trap detection |
+| `frontier.py` | Front/back queues, due heap, leases |
 | `dns.py` | Resolution cache with negative caching and request collapsing |
 | `urlnorm.py` | Canonicalisation (pure, idempotent) |
 | `storage.py` | Blob store — bodies go here |
@@ -59,6 +60,9 @@ Tests that exist for a specific reason:
 | `test_ratelimit.py::test_denial_does_not_deduct_from_the_other_bucket` | Why both buckets are in one Lua script — otherwise tokens leak and good hosts starve. |
 | `test_urlnorm.py::test_canonicalise_is_idempotent` | A non-idempotent canonicaliser silently defeats de-duplication. |
 | `test_frontier.py::test_release_does_not_steal_a_reissued_lease` | After a lease expires and is reissued, the old holder must not free it. |
+| `test_dedup.py::test_a_pathological_bloom_loses_nothing` | The hybrid must survive a 100%-false-positive Bloom. This is what makes Option C safe and Option A a trap. |
+| `test_frontier.py::test_a_released_url_cannot_be_requeued_forever` | The in-queue set is deleted on lease; only the global filter stops endless re-crawling. |
+| `test_frontier.py::test_budget_exhaustion_does_not_permanently_lose_urls` | Seen-marking is irreversible, budget is not — so the order they run in decides whether a URL is lost. |
 
 ## Two decisions that differ from the naive reading
 
@@ -72,6 +76,33 @@ slower crawling. See `RobotsRules.crawl_delay`.
 (allow all). A server demanding credentials for robots.txt is signalling
 deliberate access control, and crawling it anyway is not defensible. 404/410 still
 allow, per spec.
+
+## De-duplication: three doors into the frontier
+
+[URL-DE-DUPLICATION.md](../features/URL-DE-DUPLICATION.md) is implemented across
+`urlnorm.py` (canonicalisation) and `dedup.py` (everything else). The seen-URL test
+is the hybrid — Bloom as a *negative* filter in front of an exact store:
+
+```
+Bloom "definitely new"  → skip the lookup, insert          ~90% of traffic
+Bloom "maybe seen"      → the exact store has the final say
+```
+
+A Bloom filter alone is the trap the doc warns about: its false positives mean a URL
+is **permanently never crawled**, silently. In the hybrid the same false positive
+costs one lookup instead of one document. `test_a_pathological_bloom_loses_nothing`
+proves this by running the filter with a Bloom that returns "maybe" for *everything*.
+
+Because the filter is irreversible, the frontier has three distinct entry points:
+
+| Method | Seen filter | Budget | Use |
+| --- | --- | --- | --- |
+| `add_many(urls)` | enforced | charged | Discovery — links found while parsing |
+| `schedule_recrawl(url)` | **bypassed** | not charged | Refresh — the periodic re-fetch |
+| `requeue(task)` | **bypassed** | not charged | Retry — 5xx decay, rate-limit deferral |
+
+Prefer `add_many`. Batching is the whole point: point lookups against a 4 TB store are
+the bottleneck, so URLs are accumulated, sorted by fingerprint, and swept once per shard.
 
 ## Redirects cost politeness budget
 
