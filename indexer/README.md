@@ -1,4 +1,4 @@
-# indexer — parse stage
+# indexer — parse stage + inverted index
 
 Implementation of [features/HTML-PARSER.md](../features/HTML-PARSER.md).
 
@@ -17,7 +17,14 @@ raw bytes
   → ParsedDocument
 ```
 
-## Modules
+## Two packages live here
+
+| Package | Implements | Entry point |
+| --- | --- | --- |
+| `atlas_indexer` | [HTML-PARSER.md](../features/HTML-PARSER.md) — the parse stage | `Parser`, `ParseWorker` |
+| `atlas_indexer.index` | [INVERTED-INDEX.md](../features/INVERTED-INDEX.md) — the block-max index | `Index`, `InputDocument` |
+
+## Parse modules
 
 | Module | Responsibility |
 | --- | --- |
@@ -48,7 +55,7 @@ python -m atlas_indexer.main --blob-dir ../crawler/blobs --metrics-port 9101
 ## Test
 
 ```bash
-pytest -q          # 207 tests, no network, no Kafka, no S3
+pytest -q          # 347 tests, no network, no Kafka, no S3
 ```
 
 ## Three bugs the tests caught
@@ -123,6 +130,100 @@ costs only `tldextract`. That is a mitigation, not the fix.
 - **Subprocess isolation.** In-process caps bound size, node count and depth; they
   cannot bound wall time or RSS. `parse.parse_in_subprocess` is the documented seam
   and is not wired up.
+
+## The inverted index (`atlas_indexer.index`)
+
+**This is the Target artifact, not the Build.** INVERTED-INDEX.md is explicit
+that the Build should use Lucene via OpenSearch and not hand-roll an index
+format — and that guidance still holds. What lives here is the format the Build
+migrates *to*, once per-document JVM overhead and the absence of a tiering
+primitive stop being acceptable, plus a reference implementation that makes the
+mechanics directly testable.
+
+| Module | Responsibility |
+| --- | --- |
+| `codec.py` | varint, d-gaps, bitpacking, f32-safe rounding |
+| `dictionary.py` | Front-coded term dictionary, binary-searched |
+| `postings.py` | Block-max posting lists + skip table; the cursor |
+| `scoring.py` | BM25, split so block maxima survive IDF changes |
+| `wand.py` | Block-Max WAND, plus the exhaustive reference scorer |
+| `deletes.py` | Tombstones, applied at query time |
+| `segment.py` | Immutable segment: manifest, checksums, forward index |
+| `merge.py` | LSM compaction — **recomputes block maxima** |
+| `writer.py` | docID assignment in static-rank order |
+| `index.py` | Multi-segment search, generations |
+
+```python
+from atlas_indexer.index import Index, InputDocument
+
+index = Index(path)
+index.add_documents([
+    InputDocument.from_tokens("doc-1", ["block", "max", "wand"], static_rank=0.9),
+])
+index.publish("gen-20260908-0600")
+index.search(["block", "wand"], k=10)
+```
+
+### Measured on a 20k-document corpus
+
+| | Achieved | Doc's estimate |
+| --- | --- | --- |
+| postings.bin | **1.10 B/posting** | ~1.3 |
+| positions.bin | 1.18 B/position | ~0.9 |
+| terms.dict | 12.9 B/term | — |
+| Total vs. fixed-width | **25.9%** | — |
+
+Positions come in worse than estimated because a synthetic corpus has no
+locality; real documents produce smaller position deltas.
+
+### Two bugs the equivalence test caught
+
+`search` must return exactly what `search_exhaustive` returns. That property is
+what these tests exist for, and it found two genuine algorithm bugs that would
+have degraded results silently in production:
+
+**Inspecting a block moved the cursor.** `advance_block` advanced the *document*
+pointer as a side effect, but Block-Max WAND checks bounds for terms still
+positioned behind the pivot — so every posting between their position and the
+pivot was skipped. Bound inspection is now `block_max_at()`, a pure read.
+
+**The pivot prefix excluded tied terms.** The cumulative-bound scan stops at the
+first term that pushes the sum past theta, but ties are adjacent in the sorted
+order, so other terms could sit on the *same document* with their bounds
+uncounted. `block_sum` was an underestimate, and an underestimated bound skips a
+real winner. Found via a document matching three of four query terms where only
+two were counted.
+
+A third, smaller one: block maxima are computed in f64 and stored as f32, and
+plain truncation rounds **down** — turning a true upper bound into a value
+fractionally below the real maximum. `round_up_f32` nudges to the next
+representable value.
+
+### Why the bound is load-bearing
+
+`TestStaleMaximaBreakRetrieval` builds segments with maxima scaled by 0.25x,
+1.0x and 4.0x, and asserts that understated bounds *do* lose results while
+overstated ones cost work but never change the answer. That is the failure
+INVERTED-INDEX.md singles out — "skip data stale after merge -> wrong results,
+silently" — and it is why `merge.py` recomputes rather than copies.
+
+The mechanism: block maxima bound BM25's saturation term, which contains
+`|d| / avgdl`. Merging changes `avgdl`, and if it *rises* the denominator shrinks,
+saturation rises, and a copied maximum becomes an underestimate. Scoring is
+factorised so IDF is applied at query time — meaning `N` and `df` can change
+freely without invalidating a bound — but `avgdl` cannot be factored out.
+
+### Static rank is the docID order
+
+`IndexBuilder` sorts by descending static rank before assigning docIDs. Posting
+lists are in docID order for d-gap compression anyway, so making docID order
+*also* quality order means walking a list forward walks best-to-worst, theta
+rises fast, and pruning bites early.
+
+It is also exactly why re-scoring the corpus is a full rebuild: changing the
+static-rank formula changes the docID assignment, invalidating every posting
+list, every d-gap and every block maximum. `test_merge_preserves_static_rank_order`
+holds this down.
 
 ## Environment
 
