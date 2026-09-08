@@ -23,6 +23,7 @@ raw bytes
 | --- | --- | --- |
 | `atlas_indexer` | [HTML-PARSER.md](../features/HTML-PARSER.md) — the parse stage | `Parser`, `ParseWorker` |
 | `atlas_indexer.index` | [INVERTED-INDEX.md](../features/INVERTED-INDEX.md) — the block-max index | `Index`, `InputDocument` |
+| `atlas_indexer.analysis` | [TOKENIZATION.md](../features/TOKENIZATION.md) — text analysis | `Analyzer` |
 
 ## Parse modules
 
@@ -55,7 +56,7 @@ python -m atlas_indexer.main --blob-dir ../crawler/blobs --metrics-port 9101
 ## Test
 
 ```bash
-pytest -q          # 347 tests, no network, no Kafka, no S3
+pytest -q          # 511 tests, no network, no Kafka, no S3
 ```
 
 ## Three bugs the tests caught
@@ -224,6 +225,133 @@ It is also exactly why re-scoring the corpus is a full rebuild: changing the
 static-rank formula changes the docID assignment, invalidating every posting
 list, every d-gap and every block maximum. `test_merge_preserves_static_rank_order`
 holds this down.
+
+## Text analysis (`atlas_indexer.analysis`)
+
+Named `analysis` rather than `tokenize` because the latter shadows a stdlib
+module, and because tokenisation is one step of several.
+
+| Module | Responsibility |
+| --- | --- |
+| `normalize.py` | NFKC, full case folding, the language-dependent diacritic policy |
+| `protect.py` | Identifiers that must not be split, and which ones emit parts |
+| `segment.py` | Script detection, per-run dispatch, CJK/Thai bigrams |
+| `stem.py` | Snowball, 36 languages; surface form kept alongside the stem |
+| `analyzer.py` | The one function, two callers; config fingerprinting |
+
+### The rule everything serves
+
+**The query is tokenised exactly like the document.** Asymmetry produces terms
+that can never match, and it fails silently — documents just do not appear.
+
+The doc sketches this as `analyze(text, lang, query_side=False)` and notes the
+flag may only control things that cannot break matching. A flag is a weak
+guarantee: nothing stops a later edit from reading it inside the stemmer. So the
+flag is kept for the documented signature but **never reaches the pipeline** —
+`_analyze_core` takes no such argument, and query-side work is strictly additive
+on top of its output. `test_query_side_flag_never_reaches_the_pipeline` asserts
+that structurally, by inspecting the signature.
+
+`AnalyzerConfig` is fingerprinted into `Analyzer.version`, recorded in the
+segment manifest, and checked at query time. `test_the_mismatch_is_not_theoretical`
+builds an index with stemming on, queries it with stemming off, and shows the
+document silently vanishing — which is what the gate prevents.
+
+### Two bugs the tests caught
+
+**Mixed-script text lost its CJK segmentation.** `日本語のテキスト and English` is
+majority-Latin *by character count*, so dispatching on the document's dominant
+script left the Japanese as one giant token nobody could match. Segmentation now
+runs per script run, not per document.
+
+**IP addresses emitted noise octets.** `192.168.1.1` was split into `192`, `168`,
+`1`, `1` alongside the whole. Standalone `1` is pure noise and an IP is only ever
+searched whole, so protected patterns now carry a per-pattern parts policy —
+`COVID-19` emits parts, `192.168.1.1` does not.
+
+### One finding worth knowing
+
+Snowball's German stemmer strips umlauts as part of its algorithm, so `schön`
+stems to `schon` regardless of the fold policy. The careful German
+TRANSLITERATE rule (`ä`→`ae`, never `ä`→`a`) is therefore **partly defeated by
+the stemmer**.
+
+It stays acceptable because the surface form is indexed too: a query for `schön`
+matches surface + transliteration + stem — three terms — while `schon` matches
+fewer, so exact still ranks higher. Precision from the surface, recall from the
+stem. `test_german_stemmer_folds_umlauts_and_that_is_survivable` pins it so the
+behaviour is not rediscovered as a surprise.
+
+### Small correction to the doc
+
+TOKENIZATION.md gives `university -> univers, universe -> univers` as the
+Snowball collision example. Snowball actually produces `universiti` for
+`university`; the collision is real but between `university` and `universities`.
+
+## BM25F (`bm25f.py`, `fielded.py`, `tuning.py`)
+
+Implements [BM25.md](../features/BM25.md). The central point is **where the
+saturation goes**:
+
+```
+WRONG   score = Σ w_f · BM25(field_f)      saturate per field, then sum
+RIGHT   f̃     = Σ w_f · f(t,field_f)/norm_f    then ONE saturation over f̃
+```
+
+`score_per_field_saturation` implements the wrong version deliberately, so the
+attack it opens can be demonstrated rather than asserted. On a real index:
+
+| | honest doc | stuffed doc | stuffer's edge |
+| --- | --- | --- | --- |
+| One saturation (correct) | 5.01 | 5.34 | **1.07×** |
+| Per-field saturation | 18.79 | 42.41 | **2.26×** |
+
+**BM25F bounds the stuffing payoff; it does not eliminate it.** A term genuinely
+in the title and the URL *is* worth more, and BM25F is right to say so — what the
+single saturation prevents is the payoff *scaling with the number of fields*.
+Removing the last 7% is anti-spam's job, not the scoring function's. Worth being
+precise about, because over-claiming here would be misleading.
+
+### Fielded layout
+
+A term is stored once per field under a prefixed key `field term`. ` `
+cannot occur in analysed text, so the namespaces cannot collide — and the whole
+existing segment machinery (dictionary, block-max postings, merge, tombstones)
+is reused without a format change.
+
+Each field's posting stores the **unweighted, length-normalised** contribution
+`tf / norm_f`, not a saturated score. So field weights and `k1` stay query-time
+knobs — which matters, because the doc notes field weights move NDCG far more
+than `k1`/`b` do, and `test_reweighting_changes_ranking_without_a_rebuild` shows
+reweighting flipping the ranking with no re-index. Per-field `b` *is* baked in
+and needs a rebuild, the same trade the index already makes for static rank.
+
+### Document frequency across fields
+
+`FieldedSegment.document_frequency` counts distinct *documents*, not per-field
+occurrences. Summing per-field DF would over-count a document holding the term in
+both its title and its body, deflating IDF for exactly the terms that matter most.
+
+### Static rank is additive in log space
+
+`final = BM25F + α·log(1+pagerank) + β·quality`. Multiplicative would let one
+high-authority document with a weak textual match beat a perfect match on a small
+site — the "big sites always win" failure. `combine_multiplicative` is kept
+alongside so `test_multiplicative_does_let_it_happen` can show it failing.
+
+### Anchor capping
+
+Anchors carry the highest weight *and* are the only field an attacker controls
+from outside the document. `AnchorAggregator` applies two limits, because either
+alone is insufficient: a per-domain cap (one site repeating a phrase 10,000 times
+counts once) and a domain-diversity discount (a term vouched for by one site is
+scaled down even under the cap, because the signal anchors carry is consensus).
+
+### Tuning
+
+`tuning.py` provides NDCG@k and a generic grid search. `test_k1_and_b_gains_are_modest`
+checks the doc's claim on real data rather than taking it on faith: the spread
+across the whole `k1`×`b` grid stays under 0.35 NDCG.
 
 ## Environment
 
